@@ -55,6 +55,7 @@ from smart_dictate.config import AppConfig, load_config, save_config
 from smart_dictate.hotkeys import Hotkey, HotkeyManager, format_hotkey
 from smart_dictate.languages import list_languages
 from smart_dictate.keychain import get_postprocess_api_key, set_postprocess_api_key
+from smart_dictate.login_item import ensure_login_item_start
 from smart_dictate.model_manager import ensure_model
 from smart_dictate.models_catalog import (
     delete_model,
@@ -788,6 +789,7 @@ class DictateApp:
         self._transcribing_count = 0
         self._transcribing_lock = threading.Lock()
         self._pending_permission_notice = False
+        self._accessibility_watch_active = False
         self._model_idle_minutes: int | None = None
         self._model_idle_seconds = 0
         self._model_idle_timer: threading.Timer | None = None
@@ -835,6 +837,7 @@ class DictateApp:
             Hotkey(modifiers=self._hotkey_modifiers, keycode=self._hotkey_keycode)
         )
         self._reset_permissions_on_start()
+        ensure_login_item_start()
         if self._defer_warmup:
             logging.getLogger(__name__).info(
                 "Deferring model warmup due to low RAM (%s bytes).",
@@ -1035,25 +1038,34 @@ class DictateApp:
         self._save_config_state()
         self._schedule_model_unload()
 
-    def reset_permission(self, service: str) -> None:
+    def reset_permission(self, service: str) -> bool:
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["tccutil", "reset", service, BUNDLE_ID],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            logging.getLogger(__name__).info(
-                "Reset %s permission for %s",
-                service,
-                BUNDLE_ID,
-            )
+            if result.returncode == 0:
+                logging.getLogger(__name__).info(
+                    "Reset %s permission for %s",
+                    service,
+                    BUNDLE_ID,
+                )
+            else:
+                logging.getLogger(__name__).warning(
+                    "tccutil reset %s failed with exit code %s",
+                    service,
+                    result.returncode,
+                )
+            return result.returncode == 0
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "Failed to reset %s permission: %s",
                 service,
                 exc,
             )
+            return False
 
     def _reset_permissions_on_start(self) -> None:
         if not getattr(sys, "frozen", False):
@@ -1067,17 +1079,90 @@ class DictateApp:
         self._pending_permission_notice = True
         self._save_config_state()
 
+    def _is_accessibility_trusted(self) -> bool:
+        try:
+            return bool(Quartz.AXIsProcessTrusted())
+        except Exception:
+            return False
+
+    def _open_accessibility_settings(self) -> None:
+        try:
+            subprocess.run(
+                [
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Failed to open Accessibility settings: %s",
+                exc,
+            )
+
+    def _watch_accessibility_and_enable_hotkeys(self) -> None:
+        try:
+            while True:
+                if self._is_accessibility_trusted():
+                    NSOperationQueue.mainQueue().addOperationWithBlock_(
+                        self._enable_hotkeys_after_accessibility_granted
+                    )
+                    return
+                time.sleep(1.0)
+        finally:
+            self._accessibility_watch_active = False
+
+    def _enable_hotkeys_after_accessibility_granted(self) -> None:
+        self._clear_pending_permission_notice()
+        try:
+            self._hotkeys.start()
+        except RuntimeError as exc:
+            logging.getLogger(__name__).warning(
+                "Failed to activate hotkeys after Accessibility grant: %s",
+                exc,
+            )
+            self._pending_permission_notice = True
+            self._save_config_state()
+            return
+        if self._controller is not None:
+            self._controller.update_indicator()
+
+    def _start_accessibility_watch(self) -> None:
+        if self._accessibility_watch_active:
+            return
+        self._accessibility_watch_active = True
+        thread = threading.Thread(
+            target=self._watch_accessibility_and_enable_hotkeys,
+            daemon=True,
+        )
+        thread.start()
+
+    def _clear_pending_permission_notice(self) -> None:
+        if not self._pending_permission_notice:
+            return
+        self._pending_permission_notice = False
+
     def _show_permission_notice(self) -> None:
+        if self._is_accessibility_trusted():
+            self._clear_pending_permission_notice()
+            return
         alert = NSAlert.alloc().init()
         alert.setAlertStyle_(NSAlertStyleInformational)
-        alert.setMessageText_("Permissions were reset")
+        alert.setMessageText_("Enable Accessibility")
         alert.setInformativeText_(
-            "SmartDictate reset Microphone and Accessibility permissions for this build. "
-            "If Accessibility still does not work, remove SmartDictate from the list in "
-            "System Settings → Privacy & Security → Accessibility and add it again."
+            "Accessibility permission was reset for this app version. "
+            "Open System Settings → Privacy & Security → Accessibility and enable SmartDictate. "
+            "Hotkeys will be activated automatically after access is granted."
         )
-        alert.addButtonWithTitle_("OK")
-        alert.runModal()
+        alert.addButtonWithTitle_("Open Accessibility Settings")
+        alert.addButtonWithTitle_("Later")
+        response = alert.runModal()
+        if response != NSAlertFirstButtonReturn:
+            return
+        self._open_accessibility_settings()
+        self._start_accessibility_watch()
 
     def delete_downloaded_model(self, model_id: str) -> None:
         delete_model(models_dir(), model_id)
@@ -1379,6 +1464,8 @@ class DictateApp:
         app = NSApplication.sharedApplication()
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         self._controller = StatusBarController.alloc().initWithApp_(self)
+        if self._pending_permission_notice and self._is_accessibility_trusted():
+            self._clear_pending_permission_notice()
         try:
             self._hotkeys.start()
         except RuntimeError as exc:

@@ -20,13 +20,35 @@ class AppConfig:
     hotkey_label: str | None = None
 
 
+def _toml_quote(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace("\b", "\\b")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\f", "\\f")
+        .replace("\r", "\\r")
+        .replace('"', '\\"')
+    )
+    return f"\"{escaped}\""
+
+
 def load_config(path: Path) -> AppConfig:
+    def _read_toml(file_path: Path) -> dict | None:
+        try:
+            return tomllib.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
     if not path.exists():
         return AppConfig()
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return AppConfig()
+    data = _read_toml(path)
+    if data is None:
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        if backup_path.exists():
+            data = _read_toml(backup_path)
+        if data is None:
+            return AppConfig()
     transcription = data.get("transcription", {})
     app = data.get("app", {})
     postprocess = data.get("postprocess", {})
@@ -127,22 +149,28 @@ def save_config(path: Path, config: AppConfig) -> None:
     label = config.hotkey_label or ""
     content = (
         "[app]\n"
-        f"hash = \"{app_hash}\"\n"
+        f"hash = {_toml_quote(app_hash)}\n"
         "\n"
         "[postprocess]\n"
-        f"enabled = \"{postprocess_enabled}\"\n"
-        f"base_url = \"{postprocess_base_url}\"\n"
-        f"model = \"{postprocess_model}\"\n"
-        f"system_prompt = \"{postprocess_system_prompt}\"\n"
+        f"enabled = {_toml_quote(postprocess_enabled)}\n"
+        f"base_url = {_toml_quote(postprocess_base_url)}\n"
+        f"model = {_toml_quote(postprocess_model)}\n"
+        f"system_prompt = {_toml_quote(postprocess_system_prompt)}\n"
         "\n"
         "[transcription]\n"
-        f"language = \"{language}\"\n"
-        f"model_id = \"{model_id}\"\n"
-        f"model_idle_minutes = \"{idle_minutes}\"\n"
+        f"language = {_toml_quote(language)}\n"
+        f"model_id = {_toml_quote(model_id)}\n"
+        f"model_idle_minutes = {_toml_quote(idle_minutes)}\n"
         "\n"
         "[hotkey]\n"
-        f"modifiers = \"{modifiers}\"\n"
-        f"keycode = \"{keycode}\"\n"
-        f"label = \"{label}\"\n"
+        f"modifiers = {_toml_quote(modifiers)}\n"
+        f"keycode = {_toml_quote(keycode)}\n"
+        f"label = {_toml_quote(label)}\n"
     )
+    if path.exists():
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        try:
+            backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
     path.write_text(content, encoding="utf-8")
