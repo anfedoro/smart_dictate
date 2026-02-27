@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smart-dictate"
+version = "0.1.0"
+description = "Local macOS dictation with MLX Whisper."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "mlx-whisper",
+  "huggingface-hub",
+  "pyobjc-framework-Cocoa",
+  "pyobjc-framework-Quartz",
+  "pyobjc-framework-AVFoundation",
+]
+
+[project.scripts]
+smart-dictate = "smart_dictate.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["smart_dictate"]
